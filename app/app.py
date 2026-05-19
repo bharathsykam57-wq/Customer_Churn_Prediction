@@ -5,7 +5,6 @@ import numpy as np
 import joblib
 from sklearn.preprocessing import StandardScaler
 
-# Resolve paths relative to this file so the app works from any directory
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(APP_DIR, '..', 'data', 'Customer-Churn.csv')
 MODEL_PATH = os.path.join(APP_DIR, '..', 'models', 'ada_boost_churn_model.pkl')
@@ -19,18 +18,6 @@ def load_data(path):
 
 @st.cache_resource
 def build_preprocessor(df):
-    """
-    Replicate the cleaning and feature engineering steps from the notebook:
-    1. Convert TotalCharges to numeric
-    2. Drop rows with NaN
-    3. Create tenure_bin using pd.cut with the same bins and labels
-    4. Drop customerID, Churn, tenure
-    5. One-hot encode with drop_first=True
-    6. Fit a StandardScaler on the result
-
-    Returns a dict with template_columns, scaler, tenure_bins, and sample_df
-    for use in the input form.
-    """
     telco = df.copy()
     telco['TotalCharges'] = pd.to_numeric(telco['TotalCharges'], errors='coerce')
     telco.dropna(how='any', inplace=True)
@@ -54,17 +41,6 @@ def build_preprocessor(df):
 
 
 def preprocess_input(user_input, prep):
-    """
-    Transform a single user input dict into a scaled feature array.
-
-    Steps:
-    1. Create a single-row DataFrame from user input
-    2. Compute tenure_bin from raw tenure
-    3. Drop tenure (replaced by tenure_bin)
-    4. One-hot encode with drop_first=True
-    5. Reindex to match training columns (fills missing dummies with 0)
-    6. Scale using the pre-fitted StandardScaler
-    """
     df_in = pd.DataFrame([user_input])
 
     bins, labels = prep['tenure_bins']
@@ -72,20 +48,31 @@ def preprocess_input(user_input, prep):
     df_in = df_in.drop(columns=['tenure'])
 
     df_in_enc = pd.get_dummies(df_in, drop_first=True)
+    df_in_enc = df_in_enc.reindex(columns=prep['template_columns'], fill_value=0)
 
-    template_cols = prep['template_columns']
-    df_in_enc = df_in_enc.reindex(columns=template_cols, fill_value=0)
-
-    scaler = prep['scaler']
-    X_scaled = scaler.transform(df_in_enc)
-
+    X_scaled = prep['scaler'].transform(df_in_enc)
     return X_scaled
 
 
 @st.cache_resource
 def load_model(path):
-    model = joblib.load(path)
-    return model
+    return joblib.load(path)
+
+
+def is_categorical(series):
+    """
+    Returns True if the column should be rendered as a selectbox.
+    Uses pd.api.types.is_string_dtype to handle both older pandas 'object'
+    and newer pandas 'str' dtypes correctly.
+    Also treats low-cardinality numeric columns (e.g. SeniorCitizen 0/1) as categorical.
+    """
+    if pd.api.types.is_string_dtype(series):
+        return True
+    if str(series.dtype) == 'category':
+        return True
+    if pd.api.types.is_numeric_dtype(series) and series.nunique() < 5:
+        return True
+    return False
 
 
 def main():
@@ -98,37 +85,39 @@ def main():
 
     st.markdown('### Provide customer details to get churn prediction')
 
-    sample = prep['sample_df']
+    sample = prep['sample_df'].copy()
+    sample['TotalCharges'] = pd.to_numeric(sample['TotalCharges'], errors='coerce')
+
+    cols_to_ask = [
+        c for c in sample.columns
+        if c not in ['customerID', 'Churn', 'tenure', 'tenure_bin']
+    ]
 
     with st.form('input_form'):
-        tenure = st.slider(
+        user_input = {}
+
+        user_input['tenure'] = st.slider(
             'Tenure (months)',
             min_value=int(sample['tenure'].min()),
             max_value=int(sample['tenure'].max()),
             value=12
         )
 
-        user_input = {'tenure': tenure}
-
-        cols_to_ask = [
-            c for c in sample.columns
-            if c not in ['customerID', 'Churn', 'tenure', 'tenure_bin']
-        ]
-
         for col in cols_to_ask:
-            if sample[col].dtype == 'object' or sample[col].dtype.name == 'category':
-                opts = sorted(sample[col].dropna().unique().tolist())
+            if is_categorical(sample[col]):
+                opts = sorted(sample[col].dropna().astype(str).unique().tolist())
                 user_input[col] = st.selectbox(col, opts)
             else:
                 if pd.api.types.is_integer_dtype(sample[col]):
                     minv = int(sample[col].min())
                     maxv = int(sample[col].max())
                     default = int(sample[col].median())
+                    user_input[col] = st.number_input(col, value=default, min_value=minv, max_value=maxv)
                 else:
                     minv = float(sample[col].min())
                     maxv = float(sample[col].max())
                     default = float(sample[col].median())
-                user_input[col] = st.number_input(col, value=default, min_value=minv, max_value=maxv)
+                    user_input[col] = st.number_input(col, value=default, min_value=minv, max_value=maxv)
 
         submitted = st.form_submit_button('Predict')
 
@@ -145,39 +134,11 @@ def main():
         if st.checkbox('Show debug info'):
             st.write('**Raw input**', user_input)
 
-            bins, labels = prep['tenure_bins']
-            df_in = pd.DataFrame([user_input])
-            df_in['tenure_bin'] = pd.cut(df_in['tenure'], bins=bins, labels=labels, include_lowest=True)
-            df_drop = df_in.drop(columns=['tenure'])
-
-            st.write('**After adding tenure_bin (raw)**')
-            st.write(df_in)
-
-            st.write('**One-hot encoded (before reindex)**')
-            df_in_enc = pd.get_dummies(df_drop, drop_first=True)
-            st.write(df_in_enc)
-
-            st.write('**Reindexed (matches model features)**')
-            df_reindexed = df_in_enc.reindex(columns=prep['template_columns'], fill_value=0)
-            st.write(df_reindexed)
-
-            st.write('**Scaled features (first 20)**')
-            st.write(X_in.flatten()[:20].tolist())
-
-            nonzero = [
-                (col, int(val))
-                for col, val in zip(prep['template_columns'], df_reindexed.iloc[0])
-                if val != 0
-            ]
-            st.write('**Non-zero feature dummies**', nonzero)
-
-        st.success('Prediction complete')
-
     st.markdown('---')
     st.markdown(
         '**Notes:** This app replicates preprocessing used in the notebook: '
-        'tenure is binned into `tenure_bin`, categorical variables are one-hot encoded '
-        'with `drop_first=True`, and features are scaled with `StandardScaler`.'
+        'tenure is binned into tenure_bin, categorical variables are one-hot encoded '
+        'with drop_first=True, and features are scaled with StandardScaler.'
     )
 
 
